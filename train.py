@@ -37,7 +37,7 @@ def train_autoencoder(
     train_data: torch.Tensor,
     val_data:   torch.Tensor,
     epochs:     int = cfg.AE_EPOCHS,
-    device:     str = "cpu",
+    device:     str = f"cuda" if torch.cuda.is_available() else "cpu",
 ) -> FlowAutoencoder:
     """
     Train the unsupervised autoencoder on benign flow features.
