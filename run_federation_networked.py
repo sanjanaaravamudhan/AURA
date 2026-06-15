@@ -254,9 +254,15 @@ if __name__ == "__main__":
                         help="Start server and wait for remote clients (no local client procs)")
     args = parser.parse_args()
 
-    run(
-        server_address = args.server_address,
-        rounds         = args.rounds,
-        server_only    = args.server_only,
-    )
+    def run(server_address: str, rounds: int, server_only: bool) -> None:
+    print_banner(server_address)
 
+    # --- ADD THIS BLOCK ---
+    # Randomly assign the Byzantine role to exactly one organization
+    for org in ORGS:
+        org["byzantine"] = False
+    
+    attacker = random.choice(ORGS)
+    attacker["byzantine"] = True
+    print(f"\n[LAUNCHER] 🎲 Randomly selected Byzantine client for this session: {attacker['client_id']}\n")
+    # ----------------------
