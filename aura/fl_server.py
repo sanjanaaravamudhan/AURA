@@ -672,7 +672,7 @@ def run_federation_simulation(blockchain_module=None, n_rounds: int = None,
         n_rounds = cfg.FL_NUM_ROUNDS
 
     if active_orgs is None:
-        active_orgs = ["hospital", "bank", "university"]
+        active_orgs = ["hospital", "bank", "university", "isp", "retail"]
 
     # Attack is tied to the bank org — only injected if bank is in active_orgs.
     # If bank is offline, all clients are honest (no meaningless FLTrust flag).
@@ -681,11 +681,16 @@ def run_federation_simulation(blockchain_module=None, n_rounds: int = None,
     else:
         attack_arg = -1   # all honest
 
+    from aura.data_loader import CICIDSDataLoader
+    _shared_loader = CICIDSDataLoader()
+    _shared_scaler = _shared_loader.fit_scaler()
+
     clients, attack_idx = create_mock_clients(
         n_clients     = len(active_orgs),
         n_samples     = 300,
         org_ids       = active_orgs,
         attack_client = attack_arg,
+        shared_scaler = _shared_scaler,
     )
     strategy = KrumFedAURA(blockchain_module=blockchain_module,
                            num_rounds=n_rounds)

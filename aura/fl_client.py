@@ -427,11 +427,12 @@ class AURAFlowerClient(fl.client.Client):
 # ─────────────────────────────────────────────────────────────────────────────
 
 def create_mock_clients(
-    n_clients:    int   = 3,
+    n_clients:    int   = 5,
     n_samples:    int   = 500,
     feature_dim:  int   = cfg.FEATURE_DIM,
     attack_client: int  = None,     # None = randomly poison one; -1 = all honest
     org_ids:      list  = None,   # Override org IDs e.g. ["hospital","university"]
+    shared_scaler        = None,
 ) -> List["AURAFlowerClient"]:
     """
     Factory function for hackathon demo.
@@ -451,7 +452,10 @@ def create_mock_clients(
     """
     import random as _random
 
-    _default_orgs = ["hospital", "bank", "university"]
+    _default_orgs = ["hospital", "bank", "university", "isp", "retail"]
+    _org_client_num = {
+        "hospital": 1, "bank": 2, "university": 3, "isp": 4, "retail": 5,
+    }
     if org_ids is None:
         org_ids = _default_orgs[:n_clients]
 
@@ -465,10 +469,20 @@ def create_mock_clients(
 
     clients = []
     for i, org_key in enumerate(org_ids):
-        client_id = f"org_{org_key}_1"
+        client_num = _org_client_num.get(org_key, i + 1)
+        client_id = f"org_{org_key}_{client_num}"
 
-        # Base data: Normal traffic
-        train_data = torch.rand(n_samples, feature_dim) * 0.3 + 0.35
+        # Real CICIDS2017 partition for this org
+        from aura.data_loader import load_client_partition
+        try:
+            train_data, val_data = load_client_partition(
+                client_id=client_id,
+                scaler=shared_scaler,
+            )
+        except (FileNotFoundError, RuntimeError, ValueError) as e:
+            logger.warning(f"[{client_id}] Falling back to synthetic data: {e}")
+            train_data = torch.rand(n_samples, feature_dim) * 0.3 + 0.35
+            val_data   = torch.rand(n_samples // 5, feature_dim) * 0.3 + 0.35
 
         if i == attack_client:
             # Strong poisoning: 80% of samples with extreme values across ALL
@@ -483,7 +497,6 @@ def create_mock_clients(
             train_data[:n_attack] = attack_rows
             logger.info(f"[{client_id}] Strong attack injection: {n_attack}/{n_samples} samples poisoned.")
 
-        val_data = torch.rand(n_samples // 5, feature_dim) * 0.3 + 0.35
         clients.append(AURAFlowerClient(client_id, train_data, val_data))
 
     return clients, attack_client   # return who was selected as Byzantine

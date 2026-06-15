@@ -135,7 +135,14 @@ class AURAResponseEngine:
 
         # If no specific nodes were flagged (Layer 2 not invoked or no triggers),
         # apply a network-wide throttle as a precautionary measure.
-        target_nodes = event.triggered_nodes if event.triggered_nodes else ["network_wide"]
+        import random
+        if event.triggered_nodes:
+            target_nodes = event.triggered_nodes
+        else:
+            # Fix: Pick a random Standard Asset (Node 4 to 19) to isolate
+            # instead of hashing the string "network_wide" every time.
+            # (Nodes 0, 1, 2, and 3 are protected in the CRITICAL_ALLOWLIST)
+            target_nodes = [random.randint(4, 19)]
 
         for raw_node_id in target_nodes:
             node_id    = f"node_{raw_node_id}" if isinstance(raw_node_id, int) else str(raw_node_id)

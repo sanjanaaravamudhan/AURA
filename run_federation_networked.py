@@ -88,6 +88,20 @@ ORGS = [
         "samples":      500,
         "description":  "University Network — normal traffic",
     },
+    {
+        "client_id":    "org_isp_4",
+        "network_sim":  "10.10.0.0/24",
+        "byzantine":    False,
+        "samples":      500,
+        "description":  "ISP Network — normal traffic",
+    },
+    {
+        "client_id":    "org_retail_5",
+        "network_sim":  "172.31.0.0/24",
+        "byzantine":    False,
+        "samples":      500,
+        "description":  "Retail Network — normal traffic",
+    },
 ]
 
 
@@ -245,3 +259,4 @@ if __name__ == "__main__":
         rounds         = args.rounds,
         server_only    = args.server_only,
     )
+

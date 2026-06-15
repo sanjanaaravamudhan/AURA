@@ -388,7 +388,8 @@ class AttackInjector:
             "ttl_state":   base_graph.get("ttl_state", {}),
             "window_id":   f"INJECTED_{attack_enum.value}_{int(time.time())}",
             "attack_type": attack_enum.value,
-            "attack_nodes": list(range(min(5, self.num_nodes))),  # First few nodes compromised
+            # Fix: Randomly select 5 nodes instead of always picking 0,1,2,3,4
+            "attack_nodes": np.random.choice(self.num_nodes, min(5, self.num_nodes), replace=False).tolist(),
             "n_attacked_edges": n_attacked,
         }
 
