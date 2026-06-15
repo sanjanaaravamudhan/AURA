@@ -188,7 +188,7 @@ def _build_root_dataset(n_samples: int = cfg.FLTRUST_ROOT_SAMPLES) -> torch.Tens
 
     Shape: [n_samples, FEATURE_DIM]  on CPU.
     """
-    # Normal traffic clusters around 0.35–0.5 in MinMax-normalised CICIDS space
+    # Normal traffic clusters around 0.35–0.5 in MinMax-normalised NF-UNSW space
     data = torch.rand(n_samples, cfg.FEATURE_DIM) * 0.15 + 0.35
     return data
 

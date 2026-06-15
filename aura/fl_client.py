@@ -485,22 +485,15 @@ def create_mock_clients(
             val_data   = torch.rand(n_samples // 5, feature_dim) * 0.3 + 0.35
 
         if i == attack_client:
-            from aura.attack_injector import AttackInjector
-            import random
-            
-            n_attack = int(n_samples * 0.8) # Keep the 80% strong poisoning ratio
-            
-            # Initialize the injector 
-            injector = AttackInjector(num_nodes=cfg.NUM_SYNTHETIC_NODES, feature_dim=feature_dim, num_edges=n_attack)
-            
-            # Pick a random attack type to simulate
-            attack_types = ["ddos", "portscan", "lateral", "exfil", "web"]
-            chosen_attack = random.choice(attack_types)
-            
-            # Inject realistic features instead of random noise
-            attack_graph = injector.inject(chosen_attack, n_attacked_edges=n_attack)
-            attack_rows = attack_graph["edge_attr"][:n_attack]
-            
+            # Strong poisoning: 80% of samples with extreme values across ALL
+            # feature groups — ensures weight update is a clear FLTrust outlier
+            # rather than noise-level drift that gets masked by random init variance.
+            n_attack = int(n_samples * 0.8)
+            attack_rows = torch.rand(n_attack, feature_dim)
+            # Spike all major feature blocks to max range (47 NF-UNSW features)
+            attack_rows[:, :16]  = torch.rand(n_attack, 16) * 0.5 + 0.5   # proto/volume/flags
+            attack_rows[:, 16:32] = torch.rand(n_attack, 16) * 0.4 + 0.6  # pkt size/throughput
+            attack_rows[:, 32:]  = torch.rand(n_attack, feature_dim - 32) * 0.6 + 0.4  # IAT/app
             train_data[:n_attack] = attack_rows
             logger.info(f"[{client_id}] Strong attack injection: {n_attack}/{n_samples} samples poisoned with {chosen_attack.upper()} signatures.")
 
@@ -543,18 +536,11 @@ def start_client(
     val_data   = torch.rand(n_samples // 5, feature_dim) * 0.3 + 0.35
 
     if is_byzantine:
-        from aura.attack_injector import AttackInjector
-        import random
-        
-        n_attack = int(n_samples * 0.8) # Upgraded to 80% to ensure FLTrust catches it
-        
-        injector = AttackInjector(num_nodes=cfg.FEATURE_DIM, feature_dim=feature_dim, num_edges=n_attack)
-        attack_types = ["ddos", "portscan", "lateral", "exfil", "web"]
-        chosen_attack = random.choice(attack_types)
-        
-        attack_graph = injector.inject(chosen_attack, n_attacked_edges=n_attack)
-        attack_rows = attack_graph["edge_attr"][:n_attack]
-        
+        # Adversarial client: poisoned data with extreme feature values
+        n_attack = n_samples // 5
+        attack_rows = torch.rand(n_attack, feature_dim)
+        attack_rows[:, [2, 3, 6]] = torch.rand(n_attack, 3) * 0.3 + 0.7   # in_bytes, in_pkts, tcp_flags
+        attack_rows[:, [4, 5, 9]] = torch.rand(n_attack, 3) * 0.2 + 0.8   # out_bytes, out_pkts, flow_dur
         train_data[:n_attack] = attack_rows
         logger.info(f"[{client_id}] Byzantine mode — {chosen_attack.upper()} poisoned data injected.")
     client = AURAFlowerClient(client_id, train_data, val_data)

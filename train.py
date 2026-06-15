@@ -1,7 +1,7 @@
 """
 train.py — AURA Model Training Pipeline
 =========================================
-Trains the FlowAutoencoder on CICIDS2017 BENIGN data.
+Trains the FlowAutoencoder on NF-UNSW-NB15-v3 benign data.
 Optionally also trains the STGNN with synthetic graph snapshots.
 
 Usage:
@@ -195,7 +195,7 @@ def main():
     logger.info(f"Training device: {device}")
 
     # ── Step 1: Load and preprocess data ────────────────────────────────────
-    print("\n[Phase 1] Loading CICIDS2017 data and fitting scaler …")
+    print("\n[Phase 1] Loading NF-UNSW-NB15-v3 data and fitting scaler …")
     loader = CICIDSDataLoader(load_fraction=0.15 if args.quick else cfg.DATA_LOAD_FRACTION)
     scaler = loader.fit_scaler()
 
@@ -204,9 +204,9 @@ def main():
     benign_flows = []
     attack_graphs_for_gnn = []
 
-    # Only use Monday (pure benign) for AE training; attack CSVs for GNN
+    # Use NF-UNSW-NB15-v3 (single CSV); benign flows filtered by Label==0
     for graph, labels in loader.stream_graphs(scaler, csv_files=[CSV_FILES[0]]):
-        # All edges in Monday should be benign — use for AE baseline
+        # Collect benign flow features for AE baseline training
         benign_flows.append(graph["edge_attr"])
 
         if len(attack_graphs_for_gnn) < 100:

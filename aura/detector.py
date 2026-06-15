@@ -312,7 +312,7 @@ class AURAInferenceEngine:
 
         Parameters
         ----------
-        graph  : dict from CICIDSDataLoader.stream_graphs()
+        graph  : dict from CICIDSDataLoader.stream_graphs() (NF-UNSW-NB15-v3)
         labels : optional ground-truth label tensor [E] for eval metrics
 
         Returns

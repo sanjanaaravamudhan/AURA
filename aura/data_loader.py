@@ -4,30 +4,23 @@ aura/data_loader.py — Phase 1: Data Ingestion & Topological Mapping
 
 Pipeline Design
 ---------------
-The CICIDS2017 'MachineLearningCSV' variant ships 78 NetFlow statistical
-features per row but *strips* the Source/Destination IP columns for privacy.
-To still construct a meaningful graph topology we apply a deterministic
-synthetic node-mapping heuristic (see `_assign_synthetic_nodes`).
+This pipeline ingests NF-UNSW-NB15-v3 NetFlow CSV data. It explicitly
+extracts IPV4_SRC_ADDR and IPV4_DST_ADDR to construct a genuine 
+spatial-topological network graph.
 
 Processing chain (in order):
   1. Raw CSV  →  strip column whitespace  →  drop Inf/NaN
   2. Label column extracted; rows split into BENIGN and ATTACK splits
   3. Benign split sanitised with IsolationForest (Poisoned Baseline Defence)
   4. MinMaxScaler fitted on sanitised benign data; applied to all splits
-  5. Rolling WINDOW_SIZE-row snapshots  →  PyTorch tensors
-  6. Synthetic edges built with TTL counter; expired edges pruned each window
-  7. Node features = per-node mean aggregation of incident edge features
+  5. Real topological edges mapped via unique Source/Destination IPs
+  6. Rolling WINDOW_SIZE-row snapshots  →  PyTorch tensors
+  7. Synthetic edges built with TTL counter; expired edges pruned each window
+  8. Node features = per-node mean aggregation of incident edge features
 
 Returns
 -------
   A Python generator that yields (graph_dict, label_vector) tuples.
-  graph_dict = {
-      "x"          : Tensor[N_nodes, F]   — node feature matrix
-      "edge_index" : Tensor[2, E]         — COO sparse adjacency
-      "edge_attr"  : Tensor[E, F]         — edge (flow) features
-      "ttl"        : dict[(src,dst) → int]— remaining TTL per edge
-  }
-  label_vector : Tensor[E] — 0=benign, 1=attack  (one per edge/flow)
 """
 
 import logging
@@ -53,151 +46,48 @@ logging.basicConfig(level=logging.INFO, format="%(asctime)s [%(levelname)s] %(me
 
 
 # ─────────────────────────────────────────────────────────────────────────────
-# Constants derived from inspection of the dataset
+# Constants
 # ─────────────────────────────────────────────────────────────────────────────
 
-# All CSV files in the MachineLearningCVE folder, ordered by weekday.
-CSV_FILES: List[str] = [
-    "dataset\Monday-WorkingHours.pcap_ISCX.csv",
-    "dataset\Tuesday-WorkingHours.pcap_ISCX.csv",
-    "dataset\Wednesday-workingHours.pcap_ISCX.csv",
-    "dataset\Thursday-WorkingHours-Morning-WebAttacks.pcap_ISCX.csv",
-    "dataset\Thursday-WorkingHours-Afternoon-Infilteration.pcap_ISCX.csv",
-    "dataset\Friday-WorkingHours-Morning.pcap_ISCX.csv",
-    "dataset\Friday-WorkingHours-Afternoon-DDos.pcap_ISCX.csv",
-    "dataset\Friday-WorkingHours-Afternoon-DDos.pcap_ISCX.csv",
-]
+DATASET_PATH = Path(__file__).parent.parent / "dataset" / "NF-UNSW-NB15-v3.csv"
+CSV_FILES: List[str] = [str(DATASET_PATH)]
 
 # ─────────────────────────────────────────────────────────────────────────────
 # Helper utilities
 # ─────────────────────────────────────────────────────────────────────────────
 
 def _strip_column_whitespace(df: pd.DataFrame) -> pd.DataFrame:
-    """
-    CICIDS2017 CSVs use inconsistent leading/trailing spaces in column names
-    (e.g. ' Label', ' Flow Duration').  This function strips all of them so
-    downstream code can reference columns by clean names.
-    """
     df.columns = [c.strip() for c in df.columns]
     return df
 
-
 def _clean_infinities_and_nans(df: pd.DataFrame, feature_cols: List[str]) -> pd.DataFrame:
-    """
-    Replace np.inf / -np.inf with NaN, then forward-fill (temporal continuity)
-    and finally back-fill remaining leading NaNs.  Any residual rows are
-    dropped as a last resort.
-
-    This is a known data-quality issue in CICIDS2017 — especially in the
-    'Flow Bytes/s' and 'Flow Packets/s' columns which occasionally see
-    divide-by-zero artifacts during pcap replay.
-    """
     df[feature_cols] = df[feature_cols].replace([np.inf, -np.inf], np.nan)
-    # Forward-fill preserves temporal continuity within NetFlow streams
     df[feature_cols] = df[feature_cols].ffill()
     df[feature_cols] = df[feature_cols].bfill()
-    # Hard drop any remaining NaN rows (should be minimal after ff/bf)
-    before = len(df)
     df = df.dropna(subset=feature_cols)
-    after = len(df)
-    if before - after > 0:
-        logger.warning(f"Dropped {before - after} rows with residual NaN/Inf after fill.")
     return df
 
-
-def _isolationforest_sanitise(
-    X: np.ndarray,
-    contamination: float = cfg.IF_CONTAMINATION
-) -> Tuple[np.ndarray, np.ndarray]:
-    """
-    Poisoned-Baseline Defence
-    --------------------------
-    Before fitting the autoencoder's baseline, we run IsolationForest on the
-    BENIGN-only split.  This scrubs extreme statistical outliers — which could
-    be mislabelled attack flows, sensor glitches, or adversarially injected
-    'poison' rows designed to skew the normal distribution.
-
-    IsolationForest works by randomly partitioning the feature space;
-    anomalous points (those requiring fewer splits to isolate) receive a
-    negative anomaly score.  Setting contamination=0.02 flags the 2% most
-    extreme rows.
-
-    Parameters
-    ----------
-    X             : ndarray[N, F] — normalised benign feature matrix
-    contamination : expected fraction of outliers in the benign split
-
-    Returns
-    -------
-    X_clean       : ndarray[N', F] — sanitised benign feature matrix (N' ≤ N)
-    mask          : boolean ndarray[N] — True = row kept
-    """
-    logger.info(f"Running IsolationForest baseline sanitisation "
-                f"(contamination={contamination}) on {len(X)} benign rows …")
-    iso = IsolationForest(
-        n_estimators=100,
-        contamination=contamination,
-        random_state=42,
-        n_jobs=-1,  # Use all available cores
-    )
-    preds = iso.fit_predict(X)           # +1 = inlier, -1 = outlier
-    mask  = preds == 1                   # Keep only inliers
+def _isolationforest_sanitise(X: np.ndarray, contamination: float = cfg.IF_CONTAMINATION) -> Tuple[np.ndarray, np.ndarray]:
+    logger.info(f"Running IsolationForest baseline sanitisation (contamination={contamination}) on {len(X)} benign rows …")
+    iso = IsolationForest(n_estimators=100, contamination=contamination, random_state=42, n_jobs=-1)
+    preds = iso.fit_predict(X)
+    mask  = preds == 1
     X_clean = X[mask]
     removed = int((~mask).sum())
-    logger.info(f"IsolationForest removed {removed} suspicious rows "
-                f"({100*removed/len(X):.2f}% of benign split). "
-                f"Clean baseline size: {len(X_clean)} rows.")
+    logger.info(f"IsolationForest removed {removed} suspicious rows. Clean baseline size: {len(X_clean)} rows.")
     return X_clean, mask
 
-
-def _assign_synthetic_nodes(
-    df: pd.DataFrame,
-    num_nodes: int = cfg.NUM_SYNTHETIC_NODES
-) -> Tuple[np.ndarray, np.ndarray]:
-    """
-    Synthetic Topology Mapping
-    ---------------------------
-    Since the MachineLearningCSV variant omits Source/Destination IP columns,
-    we reconstruct a plausible flow topology using a deterministic heuristic:
-
-      src_id = row_index % num_nodes
-      dst_id = (row_index + Destination_Port_bucket) % num_nodes
-
-    'Destination_Port_bucket' groups ports into well-known service buckets
-    (e.g., 80/443 → bucket 0, 22 → bucket 1, etc.), which mimics a real
-    network where different service types cluster on specific server nodes.
-
-    This preserves the relational structure needed for GNN message-passing
-    while being honest in demos ("simulated topology from flow statistics").
-
-    Returns
-    -------
-    src_nodes : ndarray[E] — source node IDs (int, 0 … num_nodes-1)
-    dst_nodes : ndarray[E] — destination node IDs (int, 0 … num_nodes-1)
-    """
-    port_col = "Destination Port" if "Destination Port" in df.columns else df.columns[0]
-    ports = df[port_col].values.astype(int)
-
-    # Map ports to 5 service buckets: HTTP(80,8080), HTTPS(443), SSH(22),
-    # DNS(53), and everything else — this adds semantic structure to the topology.
-    def _port_bucket(p: int) -> int:
-        if p in (80, 8080, 8000):  return 1
-        if p in (443, 8443):       return 2
-        if p == 22:                return 3
-        if p == 53:                return 4
-        return 0  # Generic / ephemeral
-
-    port_buckets  = np.array([_port_bucket(int(p)) for p in ports])
-    row_indices   = np.arange(len(df))
-
-    src_nodes = row_indices % num_nodes
-    dst_nodes = (row_indices + port_buckets + num_nodes // 2) % num_nodes
-
-    # Self-loops add no topological information — remove them
-    self_loop_mask = src_nodes == dst_nodes
-    dst_nodes[self_loop_mask] = (dst_nodes[self_loop_mask] + 1) % num_nodes
-
-    return src_nodes.astype(np.int64), dst_nodes.astype(np.int64)
+def _assign_real_nodes(df: pd.DataFrame) -> Tuple[np.ndarray, np.ndarray, int]:
+    src_col = 'IPV4_SRC_ADDR' if 'IPV4_SRC_ADDR' in df.columns else 'src_ip'
+    dst_col = 'IPV4_DST_ADDR' if 'IPV4_DST_ADDR' in df.columns else 'dst_ip'
+    
+    unique_ips = pd.concat([df[src_col], df[dst_col]]).unique()
+    ip_to_id = {ip: idx for idx, ip in enumerate(unique_ips)}
+    
+    src_nodes = df[src_col].map(ip_to_id).values.astype(np.int64)
+    dst_nodes = df[dst_col].map(ip_to_id).values.astype(np.int64)
+    
+    return src_nodes, dst_nodes, len(unique_ips)
 
 
 # ─────────────────────────────────────────────────────────────────────────────
@@ -205,50 +95,20 @@ def _assign_synthetic_nodes(
 # ─────────────────────────────────────────────────────────────────────────────
 
 class TTLEdgeTracker:
-    """
-    Lightweight Time-To-Live (TTL) tracker for graph edges.
-
-    In real NetFlow analysis, an "edge" (connection between two IPs) should
-    only persist in the graph as long as the hosts are actively communicating.
-    If no traffic is seen on an edge for EDGE_TTL_WINDOWS consecutive windows,
-    the edge is pruned — keeping the graph sparse and the GNN computationally
-    light.
-
-    This also has a security benefit: it resets the topological baseline for
-    hosts that may have been idle (preventing stale 'trusted' edges from
-    masking lateral movement that reactivates an old connection).
-    """
-
     def __init__(self, ttl: int = cfg.EDGE_TTL_WINDOWS):
-        self.ttl      = ttl
-        # Maps (src, dst) → remaining TTL ticks
+        self.ttl = ttl
         self._counters: Dict[Tuple[int, int], int] = defaultdict(lambda: ttl)
 
     def update(self, active_edges: List[Tuple[int, int]]) -> List[Tuple[int, int]]:
-        """
-        Call once per window tick.
-        1. All edges in `active_edges` have their TTL reset to maximum.
-        2. All other tracked edges have their TTL decremented by 1.
-        3. Edges whose TTL reaches 0 are pruned.
-
-        Returns the list of all currently *live* edges (active + not-yet-expired).
-        """
         active_set = set(active_edges)
-
-        # Reset TTL for currently active edges
         for e in active_set:
             self._counters[e] = self.ttl
-
-        # Decrement dormant edges
         dormant = set(self._counters.keys()) - active_set
         for e in dormant:
             self._counters[e] -= 1
-
-        # Prune expired edges
         expired = [e for e, ttl in self._counters.items() if ttl <= 0]
         for e in expired:
             del self._counters[e]
-
         return list(self._counters.keys())
 
 
@@ -256,36 +116,16 @@ class TTLEdgeTracker:
 # Node Feature Aggregator
 # ─────────────────────────────────────────────────────────────────────────────
 
-def _build_node_features(
-    edge_features: np.ndarray,    # shape [E, F]
-    src_nodes:     np.ndarray,    # shape [E]
-    dst_nodes:     np.ndarray,    # shape [E]
-    num_nodes:     int,
-    feature_dim:   int,
-) -> np.ndarray:
-    """
-    Aggregate per-edge (flow) features into per-node feature vectors.
-
-    Each node's feature vector is computed as the mean of all edge features
-    for edges incident to that node (both inbound and outbound).  This
-    captures the cumulative statistical behaviour of a host — its typical
-    byte ratios, packet rates, and IAT distributions — and forms the input
-    tensor X fed to the STGNN.
-
-    Shape:  X ∈ ℝ^{N × F}  where N = num_nodes, F = feature_dim.
-    """
-    # Initialise with zeros — nodes with no incident edges stay as zeros
+def _build_node_features(edge_features: np.ndarray, src_nodes: np.ndarray, dst_nodes: np.ndarray, num_nodes: int, feature_dim: int) -> np.ndarray:
     X = np.zeros((num_nodes, feature_dim), dtype=np.float32)
     counts = np.zeros(num_nodes, dtype=np.float32)
 
-    # Accumulate edge features into both endpoint nodes
     for i, (s, d) in enumerate(zip(src_nodes, dst_nodes)):
         X[s] += edge_features[i]
         X[d] += edge_features[i]
         counts[s] += 1
         counts[d] += 1
 
-    # Normalise by degree (avoid NaN for isolated nodes via max)
     counts = np.maximum(counts, 1.0)
     X = X / counts[:, np.newaxis]
     return X
@@ -297,119 +137,74 @@ def _build_node_features(
 
 class CICIDSDataLoader:
     """
-    End-to-end data pipeline for CICIDS2017 MachineLearningCSV → PyTorch graphs.
+    Data loader for NF-UNSW-NB15-v3 NetFlow CSV data.
 
-    Usage
-    -----
-    >>> loader = CICIDSDataLoader()
-    >>> scaler = loader.fit_scaler()              # Step 1: fit on benign data
-    >>> for graph, labels in loader.stream_graphs(scaler):  # Step 2: stream
-    ...     # graph["x"], graph["edge_index"], graph["edge_attr"]
-    ...     pass
+    Class name retained as CICIDSDataLoader for backward compatibility with
+    existing imports across the codebase (train.py, calibrate_thresholds.py,
+    dashboard.py, etc.).
     """
-
-    def __init__(
-        self,
-        csv_dir:        Path = cfg.CSV_DIR,
-        benign_csv:     str  = "Monday-WorkingHours.pcap_ISCX.csv",
-        load_fraction:  float = cfg.DATA_LOAD_FRACTION,
-        window_size:    int   = cfg.WINDOW_SIZE,
-        num_nodes:      int   = cfg.NUM_SYNTHETIC_NODES,
-    ):
-        self.csv_dir       = csv_dir
-        self.benign_csv    = benign_csv
+    def __init__(self, csv_dir: Path = cfg.CSV_DIR, load_fraction: float = cfg.DATA_LOAD_FRACTION, window_size: int = cfg.WINDOW_SIZE):
+        self.csv_dir = csv_dir
         self.load_fraction = load_fraction
-        self.window_size   = window_size
-        self.num_nodes     = num_nodes
-        self._ttl_tracker  = TTLEdgeTracker()
+        self.window_size = window_size
+        self.num_nodes = 0 
+        self._ttl_tracker = TTLEdgeTracker()
         self._scaler: Optional[MinMaxScaler] = None
-
-        # Discovered at scan time
         self._feature_cols: Optional[List[str]] = None
 
-    # ------------------------------------------------------------------
-    # Internal helpers
-    # ------------------------------------------------------------------
-
-    def _load_csv(self, filename: str) -> pd.DataFrame:
-        """Load a single CICIDS CSV file, returning a clean DataFrame."""
-        path = self.csv_dir / filename
+    def _load_csv(self, path_str: str) -> pd.DataFrame:
+        path = Path(path_str)
         if not path.exists():
             raise FileNotFoundError(f"CSV not found: {path}")
 
-        logger.info(f"Loading {filename} …")
-        # Estimate rows for fractional loading (avoids full parse)
-        # Using skiprows with a probability approximation
-        total_rows = sum(1 for _ in open(path)) - 1  # minus header
-        n_rows     = max(100, int(total_rows * self.load_fraction))
+        logger.info(f"Loading {path.name} …")
+        total_rows = sum(1 for _ in open(path)) - 1
+        n_rows = max(100, int(total_rows * self.load_fraction))
         df = pd.read_csv(path, nrows=n_rows, low_memory=False)
         df = _strip_column_whitespace(df)
 
         # Identify feature columns (everything except Label)
-        # Always rediscover — different CSVs can have columns in different order
-        all_cols = list(df.columns)
-        label_stripped = cfg.LABEL_COL.strip()
-        self._feature_cols = [c for c in all_cols if c != label_stripped]
-        logger.info(f"Discovered {len(self._feature_cols)} feature columns.")
+        if self._feature_cols is None:
+            all_cols = list(df.columns)
+            label_stripped = cfg.LABEL_COL.strip()
+            self._feature_cols = [c for c in all_cols if c != label_stripped]
+            logger.info(f"Discovered {len(self._feature_cols)} feature columns.")
 
         df = _clean_infinities_and_nans(df, self._feature_cols)
         return df
 
     def _label_to_binary(self, series: pd.Series) -> np.ndarray:
-        """Convert string labels to binary:  0 = BENIGN,  1 = ATTACK."""
-        return (series.str.strip() != cfg.BENIGN_LABEL).astype(np.int64).values
+        """Convert label column to binary (0=benign, 1=attack).
 
-    # ------------------------------------------------------------------
-    # Public Methods
-    # ------------------------------------------------------------------
+        NF-UNSW-NB15-v3 Label is already binary int (0/1).
+        Falls back to string comparison for compatibility.
+        """
+        if pd.api.types.is_numeric_dtype(series):
+            return series.values.astype(np.int64)
+        return (series.str.strip().str.upper() != "BENIGN").astype(np.int64).values
 
     def fit_scaler(self) -> MinMaxScaler:
-        """
-        Fit a MinMaxScaler on the sanitised BENIGN-only training split.
-
-        Why benign-only?  If we fit the scaler on mixed data containing
-        attacks, extreme attack values (e.g., DDoS byte floods) will
-        compress the normal-traffic range and reduce the autoencoder's
-        sensitivity to subtle anomalies.
-
-        Returns the fitted scaler so it can be persisted between phases.
-        """
-        df = self._load_csv(self.benign_csv)
-        label_col_clean = cfg.LABEL_COL.strip()
-
-        benign_df = df[df[label_col_clean].str.strip() == cfg.BENIGN_LABEL]
+        df = self._load_csv(CSV_FILES[0])
+        label_col = 'Label' if 'Label' in df.columns else cfg.LABEL_COL.strip()
+        
+        # NF-UNSW-NB15-v3: Label is binary int (0 = Benign, 1 = Attack)
+        if pd.api.types.is_numeric_dtype(df[label_col]):
+            benign_df = df[df[label_col] == cfg.BENIGN_LABEL]
+        else:
+            benign_df = df[df[label_col].str.strip() == str(cfg.BENIGN_LABEL)]
+            
         logger.info(f"Benign training rows before sanitisation: {len(benign_df)}")
 
         X_benign = benign_df[self._feature_cols].values.astype(np.float32)
-
-        # ── Step 3: Poisoned Baseline Defence ────────────────────────────────
         X_clean, _ = _isolationforest_sanitise(X_benign)
 
-        # ── Step 4: Fit scaler on clean benign distribution ──────────────────
         scaler = MinMaxScaler(feature_range=(0, 1))
         scaler.fit(X_clean)
         self._scaler = scaler
         logger.info("MinMaxScaler fitted on sanitised benign baseline.")
         return scaler
 
-    def stream_graphs(
-        self,
-        scaler: MinMaxScaler,
-        csv_files: Optional[List[str]] = None,
-    ) -> Generator[Tuple[Dict, torch.Tensor], None, None]:
-        """
-        Generator that yields (graph_dict, label_tensor) snapshots from
-        CICIDS2017 CSVs using a rolling WINDOW_SIZE-row window.
-
-        Each yield represents one "tick" of the 1-second network sensor.
-
-        graph_dict keys
-        ---------------
-        x          : FloatTensor[N, F]  — node feature matrix
-        edge_index : LongTensor[2, E]   — COO sparse adjacency (after TTL pruning)
-        edge_attr  : FloatTensor[E, F]  — edge (flow) feature matrix
-        ttl_state  : dict               — TTL counters for live edges (for UI)
-        """
+    def stream_graphs(self, scaler: MinMaxScaler, csv_files: Optional[List[str]] = None) -> Generator[Tuple[Dict, torch.Tensor], None, None]:
         if csv_files is None:
             csv_files = CSV_FILES
 
@@ -420,94 +215,68 @@ class CICIDSDataLoader:
                 logger.warning(f"Skipping missing file: {csv_file}")
                 continue
 
-            label_col_clean = cfg.LABEL_COL.strip()
-            labels_all = self._label_to_binary(df[label_col_clean])
+            label_col = 'Label' if 'Label' in df.columns else cfg.LABEL_COL.strip()
+            labels_all = self._label_to_binary(df[label_col])
 
-            # Apply the pre-fitted scaler (clamp=True silently clips unseen extremes)
-            X_scaled = scaler.transform(
-                df[self._feature_cols].values.astype(np.float32)
-            ).clip(0, 1)
+            X_scaled = scaler.transform(df[self._feature_cols].values.astype(np.float32)).clip(0, 1)
 
-            # Synthetic node assignment (row-level)
-            src_all, dst_all = _assign_synthetic_nodes(df, self.num_nodes)
+            src_all, dst_all, total_nodes = _assign_real_nodes(df)
+            self.num_nodes = total_nodes
 
             n_windows = len(df) // self.window_size
-            logger.info(f"Streaming {n_windows} windows from {csv_file} …")
+            logger.info(f"Streaming {n_windows} windows from {Path(csv_file).name} mapping {total_nodes} unique hosts…")
 
             for w in range(n_windows):
                 s = w * self.window_size
                 e = s + self.window_size
 
-                # ── Slice this window's data ──────────────────────────────
-                X_window      = X_scaled[s:e]       # [W, F]
-                src_window    = src_all[s:e]         # [W]
-                dst_window    = dst_all[s:e]         # [W]
-                labels_window = labels_all[s:e]      # [W]
+                X_window = X_scaled[s:e]
+                src_window = src_all[s:e]
+                dst_window = dst_all[s:e]
+                labels_window = labels_all[s:e]
 
-                # ── TTL Edge Decay ────────────────────────────────────────
-                active_edges  = list(zip(src_window.tolist(), dst_window.tolist()))
-                live_edges    = self._ttl_tracker.update(active_edges)
+                active_edges = list(zip(src_window.tolist(), dst_window.tolist()))
+                live_edges = self._ttl_tracker.update(active_edges)
 
-                # Build index mapping from live edges back to window rows
                 live_edge_set = set(live_edges)
-                keep_mask     = np.array([
-                    (int(src_window[i]), int(dst_window[i])) in live_edge_set
-                    for i in range(len(src_window))
-                ])
+                keep_mask = np.array([(int(src_window[i]), int(dst_window[i])) in live_edge_set for i in range(len(src_window))])
 
-                # Apply mask — only include flows on live edges
                 if keep_mask.sum() == 0:
-                    continue  # Empty window after TTL pruning; skip
+                    continue
 
-                X_edge    = X_window[keep_mask]
-                src_edge  = src_window[keep_mask]
-                dst_edge  = dst_window[keep_mask]
-                labels_w  = labels_window[keep_mask]
+                X_edge = X_window[keep_mask]
+                src_edge = src_window[keep_mask]
+                dst_edge = dst_window[keep_mask]
+                labels_w = labels_window[keep_mask]
 
-                # ── Node Feature Aggregation (X matrix for GNN) ───────────
-                X_node = _build_node_features(
-                    X_edge, src_edge, dst_edge,
-                    self.num_nodes, len(self._feature_cols)
-                )
+                X_node = _build_node_features(X_edge, src_edge, dst_edge, self.num_nodes, len(self._feature_cols))
 
-                # ── Build PyTorch tensors ─────────────────────────────────
-                edge_index = torch.tensor(
-                    np.stack([src_edge, dst_edge], axis=0),
-                    dtype=torch.long
-                )                             # shape: [2, E]
-
+                edge_index = torch.tensor(np.stack([src_edge, dst_edge], axis=0), dtype=torch.long)
                 x = torch.tensor(X_node, dtype=torch.float32)
-                # shape: [N, F]
-
                 edge_attr = torch.tensor(X_edge, dtype=torch.float32)
-                # shape: [E, F]
 
                 graph_dict = {
-                    "x":          x,
+                    "x": x,
                     "edge_index": edge_index,
-                    "edge_attr":  edge_attr,
-                    "ttl_state":  dict(self._ttl_tracker._counters),
-                    "window_id":  f"{csv_file}:w{w}",
+                    "edge_attr": edge_attr,
+                    "ttl_state": dict(self._ttl_tracker._counters),
+                    "window_id": f"{Path(csv_file).name}:w{w}",
                 }
 
                 label_tensor = torch.tensor(labels_w, dtype=torch.long)
-
                 yield graph_dict, label_tensor
-
 
 # ─────────────────────────────────────────────────────────────────────────────
 # CLI Sanity Check
 # ─────────────────────────────────────────────────────────────────────────────
 
 if __name__ == "__main__":
-    print("=== AURA Data Loader — Sanity Check ===")
+    print("=== AURA Data Loader — Real Topology Sanity Check ===")
     loader = CICIDSDataLoader(load_fraction=0.05)
-
     print("Fitting scaler on benign baseline …")
     scaler = loader.fit_scaler()
-
     print("Streaming first 3 graph windows …")
-    for i, (graph, labels) in enumerate(loader.stream_graphs(scaler, csv_files=[CSV_FILES[0]])):
+    for i, (graph, labels) in enumerate(loader.stream_graphs(scaler)):
         print(f"\n[Window {i}]  id={graph['window_id']}")
         print(f"  x.shape        = {graph['x'].shape}        (Nodes × Features)")
         print(f"  edge_index.shape= {graph['edge_index'].shape}  (2 × Edges)")
@@ -518,129 +287,3 @@ if __name__ == "__main__":
             break
 
     print("\n✓ Data loader test passed.")
-
-
-# ─────────────────────────────────────────────────────────────────────────────
-# FL Client Partition Loader
-# ─────────────────────────────────────────────────────────────────────────────
-
-# Maps each org name to the CSV files it owns
-_CLIENT_CSV_MAP: Dict[str, List[str]] = {
-    "hospital":   ["Monday-WorkingHours.pcap_ISCX.csv"],
-    "bank":       ["Tuesday-WorkingHours.pcap_ISCX.csv"],
-    "university": ["Wednesday-workingHours.pcap_ISCX.csv"],
-    "isp":        [
-                    "Thursday-WorkingHours-Morning-WebAttacks.pcap_ISCX.csv",
-                    "Thursday-WorkingHours-Afternoon-Infilteration.pcap_ISCX.csv",
-                  ],
-    "retail":     [
-                    "Friday-WorkingHours-Morning.pcap_ISCX.csv",
-                    "Friday-WorkingHours-Afternoon-DDos.pcap_ISCX.csv",
-                    "Friday-WorkingHours-Afternoon-PortScan.pcap_ISCX.csv",
-                  ],
-}
-
-
-def load_client_partition(
-    client_id: str,
-    csv_dir: Path = cfg.CSV_DIR,
-    scaler: Optional[MinMaxScaler] = None,
-) -> Tuple[torch.Tensor, torch.Tensor]:
-    """
-    Load a real CICIDS2017 data partition for one FL client.
-    Returns (train_tensor, val_tensor) — BENIGN rows only, scaled.
-
-    Parameters
-    ----------
-    client_id : e.g. "org_hospital_1", "org_isp_4", "org_retail_5"
-    csv_dir   : path to the folder containing CICIDS2017 CSVs
-    scaler    : a pre-fitted MinMaxScaler. ALWAYS pass this in from
-                a shared scaler fitted once on Monday benign data.
-                If None, fits its own scaler (only safe for single-client use).
-
-    Returns
-    -------
-    (X_train, X_val) — float32 tensors shaped [N_train, 78] and [N_val, 78]
-    """
-    # ── Extract org key from client_id ───────────────────────────────────────
-    # "org_hospital_1" → "hospital"
-    # "org_isp_4"      → "isp"
-    # "org_retail_5"   → "retail"
-    parts = client_id.split("_")          # ["org", "hospital", "1"]
-    if len(parts) >= 2:
-        org_key = parts[1]                # always the second segment
-    else:
-        raise ValueError(f"Cannot parse org key from client_id: '{client_id}'")
-
-    csv_files = _CLIENT_CSV_MAP.get(org_key)
-    if csv_files is None:
-        raise ValueError(
-            f"No CSV mapping for org '{org_key}' (from client_id '{client_id}'). "
-            f"Valid orgs: {list(_CLIENT_CSV_MAP.keys())}"
-        )
-
-    loader = CICIDSDataLoader(csv_dir=csv_dir)
-
-    # ── Fit scaler if not provided ───────────────────────────────────────────
-    # WARNING: every client should share the SAME scaler fitted on Monday
-    # benign data. If each client fits its own scaler, feature ranges will
-    # differ across clients and FLTrust cosine scoring will be meaningless.
-    if scaler is None:
-        logger.warning(
-            f"[{client_id}] No shared scaler provided — fitting own scaler on "
-            f"Monday benign data. Pass a shared scaler for correct FL behaviour."
-        )
-        scaler = loader.fit_scaler()
-
-    # ── Load and filter each CSV ─────────────────────────────────────────────
-    label_col = cfg.LABEL_COL.strip()
-    all_frames = []
-
-    for csv_file in csv_files:
-        try:
-            df = loader._load_csv(csv_file)
-        except FileNotFoundError:
-            logger.warning(f"[{client_id}] CSV not found, skipping: {csv_file}")
-            continue
-
-        # Keep BENIGN rows only — attack rows must never enter AE training
-        benign_df = df[df[label_col].str.strip() == cfg.BENIGN_LABEL]
-
-        if len(benign_df) == 0:
-            logger.warning(f"[{client_id}] No benign rows found in {csv_file}!")
-            continue
-
-        # Use the feature columns discovered during _load_csv
-        feature_cols = loader._feature_cols
-        X = benign_df[feature_cols].values.astype(np.float32)
-
-        # Scale using the shared scaler — clips to [0,1] for unseen extremes
-        X = scaler.transform(X).clip(0, 1)
-        all_frames.append(X)
-
-        logger.info(
-            f"[{client_id}] {csv_file}: {len(benign_df)} benign rows loaded."
-        )
-
-    if not all_frames:
-        raise RuntimeError(
-            f"[{client_id}] No data loaded for org '{org_key}'. "
-            f"Check that CSV files exist in: {csv_dir}"
-        )
-
-    # ── Stack all frames and split 80/20 ─────────────────────────────────────
-    X_all = np.vstack(all_frames)           # shape: [N_total, 78]
-
-    # Shuffle before splitting so val set isn't just the last file's rows
-    rng = np.random.default_rng(seed=42)
-    rng.shuffle(X_all)
-
-    split = int(len(X_all) * 0.8)
-    X_train = torch.tensor(X_all[:split], dtype=torch.float32)
-    X_val   = torch.tensor(X_all[split:], dtype=torch.float32)
-
-    logger.info(
-        f"[{client_id}] Partition ready — "
-        f"train={len(X_train)}  val={len(X_val)}  features={X_train.shape[1]}"
-    )
-    return X_train, X_val

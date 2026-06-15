@@ -282,7 +282,7 @@ def audit_feature_index_map():
         print(f"  ✓  Feature count matches FEATURE_DIM.")
     print()
 
-    # Build a reverse map: CICIDS2017 column name variants → config key
+    # Build a reverse map: NF-UNSW-NB15-v3 column name variants → config key
     # The CSV uses proper names like "Destination Port", "Flow Duration" etc.
     # We need to map config keys (snake_case) to likely CSV column names.
     # We do a case-insensitive substring match as a heuristic.

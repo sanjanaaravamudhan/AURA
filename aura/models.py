@@ -6,10 +6,10 @@ Model Architecture Summary
 ---------------------------
 
 Layer 1 — Statistical Tripwire (Unsupervised Autoencoder)
-  Input:   x ∈ ℝ^{E × F}  (E edge/flow feature vectors, F=78 features)
-  Encoder: Linear(F→64) → ReLU → Linear(64→32) → ReLU → Linear(32→Z)
+  Input:   x ∈ ℝ^{E × F}  (E edge/flow feature vectors, F=47 features)
+  Encoder: Linear(F→32) → ReLU → Linear(32→24) → ReLU → Linear(24→Z)
   Latent:  z ∈ ℝ^{E × Z}  where Z=16  (bottleneck — the "fingerprint")
-  Decoder: Linear(Z→32) → ReLU → Linear(32→64) → ReLU → Linear(64→F)
+  Decoder: Linear(Z→24) → ReLU → Linear(24→32) → ReLU → Linear(32→F)
   Loss:    MSE(input, reconstruction)  — spike = anomaly
 
   Contrastive Negative Sampling:
@@ -180,9 +180,9 @@ class FlowAutoencoder(nn.Module):
 
     Architecture
     ------------
-    Encoder:  F → 64 → 32 → Z      (compression)
+    Encoder:  F → 32 → 24 → Z      (compression)
     Latent:   Z = LATENT_DIM = 16
-    Decoder:  Z → 32 → 64 → F      (reconstruction)
+    Decoder:  Z → 24 → 32 → F      (reconstruction)
 
     Dropout(0.2) after each hidden layer prevents the model from memorising
     specific flow patterns — forcing it to learn the underlying distribution.
@@ -445,7 +445,7 @@ if __name__ == "__main__":
     print("=== AURA Models — Sanity Check ===\n")
 
     N = cfg.NUM_SYNTHETIC_NODES    # number of nodes
-    num_feats = cfg.FEATURE_DIM    # 78 features
+    num_feats = cfg.FEATURE_DIM    # 47 features (NF-UNSW-NB15-v3)
     E = 40                         # 40 synthetic edges
 
     # Synthetic graph
